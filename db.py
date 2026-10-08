@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import os
 import random
+import shutil
 import sqlite3
 import threading
+import zipfile
 from datetime import datetime, timezone
 
 DB_PATH = os.environ.get("DATABASE_PATH", "quiz.db")
@@ -33,11 +35,18 @@ def _now() -> str:
 
 def get_conn() -> sqlite3.Connection:
     global _conn
-    if _conn is None:
-        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.execute("PRAGMA foreign_keys = ON")
-    return _conn
+    conn = _conn
+    if conn is None:
+        # باز کردن اتصال زیر قفل انجام می‌شود تا وسط ریستور (replace_database_file)
+        # هیچ Threadی اتصال جدید به فایل قدیمی نسازد.
+        with _lock:
+            conn = _conn
+            if conn is None:
+                conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys = ON")
+                _conn = conn
+    return conn
 
 
 def init_db() -> None:
@@ -814,3 +823,157 @@ def list_finished_quizzes(chat_id: int, limit: int = 15) -> list[dict]:
         d["topic_name"] = t["name"] if t else "—"
         result.append(d)
     return result
+
+
+# --------------------------------------------------------------------- #
+# Backup / Restore - بک‌آپ zip از کل دیتابیس و جایگزینی کامل آن
+# فایل‌های موقت در پوشه‌ی temp سیستم ساخته می‌شوند، نه روی ولوم.
+# --------------------------------------------------------------------- #
+
+BACKUP_DB_NAME = "quiz.db"
+REQUIRED_TABLES = (
+    "users", "admins", "settings", "score_adjustments", "sections", "topics",
+    "questions", "options", "quizzes", "quiz_questions", "quiz_participants", "answers",
+)
+
+
+def list_open_quizzes() -> list[dict]:
+    """کوییزهایی که هنوز تمام یا لغو نشده‌اند (در انتظار بازیکن، در حال اجرا و ...)."""
+    rows = get_conn().execute(
+        "SELECT id, chat_id, status FROM quizzes WHERE status NOT IN ('finished','cancelled')"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_backup_zip(dest_dir: str, stamp: str) -> str:
+    """یک نسخه‌ی سازگار (با sqlite backup API) از دیتابیس زنده می‌گیرد و در یک zip می‌گذارد.
+    مسیر فایل zip را برمی‌گرداند."""
+    tmp_db = os.path.join(dest_dir, BACKUP_DB_NAME)
+    zip_path = os.path.join(dest_dir, f"quizbot_backup_{stamp}.zip")
+    with _lock:
+        dst = sqlite3.connect(tmp_db)
+        try:
+            get_conn().backup(dst)
+        finally:
+            dst.close()
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(tmp_db, BACKUP_DB_NAME)
+    os.remove(tmp_db)
+    return zip_path
+
+
+def extract_backup_zip(zip_path: str, dest_dir: str) -> tuple[str | None, str]:
+    """فایل دیتابیس را از zip بیرون می‌کشد و اعتبارسنجی می‌کند.
+    (مسیر دیتابیس یا None، پیام خطا/خلاصه) را برمی‌گرداند. به دیتابیس فعلی دست نمی‌زند."""
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except Exception:
+        return None, "فایل ارسالی یک zip معتبر نیست."
+    with zf:
+        members = [i for i in zf.infolist() if not i.is_dir() and i.filename.lower().endswith(".db")]
+        if len(members) != 1:
+            return None, "داخل zip باید دقیقاً یک فایل دیتابیس (.db) باشد."
+        info = members[0]
+        out_path = os.path.join(dest_dir, "restore_candidate.db")
+        try:
+            with zf.open(info) as src, open(out_path, "wb") as out:
+                shutil.copyfileobj(src, out, 1024 * 1024)
+        except Exception:
+            return None, "خواندن فایل داخل zip ناموفق بود (zip خراب است یا فضای کافی نیست)."
+
+    ok, msg = inspect_db_file(out_path)
+    if not ok:
+        return None, msg
+    return out_path, msg
+
+
+def inspect_db_file(path: str) -> tuple[bool, str]:
+    """بررسی می‌کند فایل یک دیتابیس سالم این ربات باشد. (True, خلاصه‌ی تعداد‌ها) یا (False, دلیل)."""
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except Exception:
+        return False, "فایل داخل zip یک دیتابیس SQLite معتبر نیست."
+    try:
+        try:
+            if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                return False, "دیتابیس داخل zip خراب است (integrity check ناموفق)."
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        except Exception:
+            return False, "فایل داخل zip یک دیتابیس SQLite معتبر نیست."
+        missing = [t for t in REQUIRED_TABLES if t not in tables]
+        if missing:
+            return False, "این بک‌آپ مربوط به نسخه‌ی قدیمی ربات است یا دیتابیس این ربات نیست. جدول‌های ناموجود: " + ", ".join(missing)
+        topic_cols = {r[1] for r in conn.execute("PRAGMA table_info(topics)")}
+        if "is_archive" not in topic_cols:
+            return False, "ساختار این بک‌آپ قدیمی است (ستون is_archive ندارد)."
+        counts = {
+            t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            for t in ("users", "questions", "quizzes")
+        }
+        return True, f"کاربران: {counts['users']} | سؤال‌ها: {counts['questions']} | کوییزها: {counts['quizzes']}"
+    except Exception:
+        return False, "بررسی دیتابیس داخل zip ناموفق بود."
+    finally:
+        conn.close()
+
+
+def replace_database_file(new_db_path: str) -> None:
+    """دیتابیس فعلی را کاملاً با فایل جدید جایگزین می‌کند:
+    اتصال بسته می‌شود، فایل قدیمی (و journal/wal/shm آن) از ولوم حذف می‌شود و فقط
+    فایل جدید می‌ماند - پس فضای فایل قدیمی واقعاً آزاد می‌شود.
+    اتصال جدید به‌صورت lazy روی فایل جدید باز می‌شود؛ بعدش init_db() را صدا بزنید."""
+    global _conn
+    target_dir = os.path.dirname(os.path.abspath(DB_PATH)) or "."
+    staging = os.path.join(target_dir, os.path.basename(DB_PATH) + ".restoring")
+    with _lock:
+        try:
+            shutil.copyfile(new_db_path, staging)  # اول کپی کامل کنار فایل اصلی (روی همان ولوم)
+        except Exception:
+            # مثلاً ولوم پر است: فایل نیمه‌کاره پاک می‌شود و دیتابیس فعلی دست‌نخورده می‌ماند
+            try:
+                os.remove(staging)
+            except FileNotFoundError:
+                pass
+            raise
+        if _conn is not None:
+            try:
+                _conn.close()
+            finally:
+                _conn = None
+        for suffix in ("-journal", "-wal", "-shm"):
+            try:
+                os.remove(DB_PATH + suffix)
+            except FileNotFoundError:
+                pass
+        os.replace(staging, DB_PATH)  # فایل قدیمی همین‌جا حذف و فضایش آزاد می‌شود
+
+
+def cancel_all_open_quizzes() -> int:
+    """بعد از ریستور: کوییزهای نیمه‌کاره‌ی داخل بک‌آپ لغو می‌شوند تا بعداً (مثلاً با
+    ری‌استارت ربات) دوباره زنده نشوند. تعداد را برمی‌گرداند."""
+    open_quizzes = list_open_quizzes()
+    for q in open_quizzes:
+        set_status(q["id"], "cancelled")
+    return len(open_quizzes)
+
+
+# --------------------------------------------------------------------- #
+# اختیارات ادمین‌ها - هر ادمین (غیر از ادمین‌های ثابت .env) برای هر بخش پنل یک دسترسی دارد.
+# پیش‌فرض: همه‌ی دسترسی‌ها فعال (مثل رفتار قبلی). ادمین اصلی (.env) از پنل خاموش/روشن می‌کند.
+# در جدول settings ذخیره می‌شود (کلید perm:<user_id>:<perm>) تا ساختار جدول‌ها عوض نشود.
+# --------------------------------------------------------------------- #
+
+ADMIN_PERMISSIONS = (
+    "topics", "questions", "quiz", "participants", "stats", "history", "settings", "backup",
+)
+
+
+def admin_perm_allowed(user_id: int, perm: str) -> bool:
+    val = get_setting(f"perm:{user_id}:{perm}")
+    if val is None and perm == "backup":
+        val = get_setting(f"perm_backup:{user_id}")  # کلید نسخه‌ی قبلی
+    return val != "0"
+
+
+def set_admin_perm(user_id: int, perm: str, allowed: bool) -> None:
+    set_setting(f"perm:{user_id}:{perm}", "1" if allowed else "0")

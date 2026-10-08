@@ -14,10 +14,14 @@ import json
 import logging
 import os
 import random
+import shutil
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 import db
@@ -114,7 +118,12 @@ def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> d
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
-    return api("sendMessage", **payload)
+    result = api("sendMessage", **payload)
+    if result and reply_markup is not None:
+        actor = getattr(_ctx, "actor", None)
+        if actor is not None and _markup_is_panel(reply_markup):
+            _register_panel(chat_id, result["message_id"], actor)
+    return result
 
 
 def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None):
@@ -141,6 +150,62 @@ def answer_callback_query(callback_query_id: str, text: str | None = None, show_
     return api("answerCallbackQuery", **payload)
 
 
+def send_document(chat_id: int, file_path: str, filename: str, caption: str | None = None) -> dict | None:
+    """ارسال فایل با multipart/form-data (فقط با urllib)."""
+    boundary = "----quizbot" + uuid.uuid4().hex
+    chunks: list[bytes] = []
+
+    def field(name: str, value) -> None:
+        chunks.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8")
+        )
+
+    field("chat_id", chat_id)
+    if caption:
+        field("caption", caption)
+    with open(file_path, "rb") as f:
+        data = f.read()
+    chunks.append(
+        (f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+         f"Content-Type: application/zip\r\n\r\n").encode("utf-8") + data + b"\r\n"
+    )
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    req = urllib.request.Request(
+        API_BASE + "sendDocument", data=b"".join(chunks),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            log.warning("HTTP error calling sendDocument: %s", exc)
+            return None
+    except Exception as exc:
+        log.warning("Network error calling sendDocument: %s", type(exc).__name__)
+        return None
+    if not payload.get("ok"):
+        log.warning("sendDocument failed: %s", payload.get("description"))
+        return None
+    return payload.get("result")
+
+
+def download_telegram_file(file_id: str, dest_path: str) -> bool:
+    info = api("getFile", file_id=file_id)
+    if not info or not info.get("file_path"):
+        return False
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{info['file_path']}"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp, open(dest_path, "wb") as out:
+            shutil.copyfileobj(resp, out, 1024 * 1024)
+    except Exception as exc:
+        log.warning("Download failed: %s", type(exc).__name__)  # عمداً URL (حاوی توکن) لاگ نمی‌شود
+        return False
+    return True
+
+
 # --------------------------------------------------------------------- #
 # ادمین - فقط کسانی که واقعاً در «حافظه‌ی ربات» ادمین‌اند: یا در ADMIN_IDS
 # ثابت (.env) هستند، یا از داخل پنل («👤 مدیریت ادمین‌ها») اضافه شده‌اند.
@@ -151,6 +216,150 @@ def answer_callback_query(callback_query_id: str, text: str | None = None, show_
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS or db.is_admin_id(user_id)
+
+
+# --------------------------------------------------------------------- #
+# دسترسی‌ها و مالکیت پنل
+#  - ادمین اصلی = ادمین‌های ثابت .env: همه‌ی دسترسی‌ها را دارد و فقط او ادمین‌ها و
+#    دسترسی‌هایشان را مدیریت می‌کند.
+#  - بقیه‌ی ادمین‌ها برای هر بخش پنل یک دسترسی دارند (پیش‌فرض فعال).
+#  - در گروه هر پنل فقط مال کسی است که آن را باز کرده؛ ادمین دیگر نمی‌تواند دکمه‌های
+#    آن را بزند. پنل کنترل کوییز فقط مال ادمینی است که کوییز را ساخته.
+# --------------------------------------------------------------------- #
+
+PERM_LABELS = {
+    "topics": "📚 مدیریت مباحث",
+    "questions": "❓ مدیریت سوالات",
+    "quiz": "🏆 برگزاری کوییز",
+    "participants": "👥 شرکت‌کنندگان",
+    "stats": "📊 آمار و امتیازات",
+    "history": "🗂 سوابق کوییزها",
+    "settings": "⚙️ تنظیمات",
+    "backup": "💾 بک‌آپ/ریستور",
+}
+MAIN_ONLY = "__main__"
+MSG_NOT_ADMIN = "⛔️ این بخش فقط برای ادمین‌ها و استاده."
+MSG_NO_PERM = "⛔️ دسترسی شما به این بخش توسط ادمین اصلی غیرفعال شده است."
+MSG_MAIN_ONLY = "🔒 فقط ادمین اصلی (ادمین‌های ثابت .env) به این بخش دسترسی دارد."
+MSG_PANEL_OTHER = "🔒 این پنل مال ادمین دیگری است؛ برای پنل خودت /admin را بزن."
+MSG_PANEL_EXPIRED = "⌛️ این پنل منقضی شده؛ برای پنل جدید /admin را بزن."
+MSG_QUIZ_OTHER = "🔒 این پنل کوییز مال ادمین دیگری است."
+
+
+def has_perm(user_id: int, perm: str) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    return db.is_admin_id(user_id) and db.admin_perm_allowed(user_id, perm)
+
+
+def can_backup(user_id: int) -> bool:
+    return has_perm(user_id, "backup")
+
+
+_ctx = threading.local()                       # «چه کسی» Update جاری را فرستاده (هر Update یک Thread جدا دارد)
+_panel_lock = threading.Lock()
+_panel_owners: "OrderedDict[tuple[int, int], int]" = OrderedDict()
+_PANEL_OWNERS_MAX = 5000
+
+_PUBLIC_CB_EXACT = ("noop", "closed")
+_PUBLIC_CB_PREFIX = ("join:", "ans:")          # دکمه‌های دانش‌آموزان
+_QUIZ_CB_PREFIX = ("start:", "next:", "pause:", "resume:", "cancel:")
+
+_CB_PERMS = (
+    (("menu:topics_sections", "sec_topics:", "topic:"), "topics"),
+    (("menu:questions_sections", "sec_questions:", "menu:questions_list:", "q:", "correct:"), "questions"),
+    (("menu:new_quiz", "quiz_sec:", "quiz_topic:", "qtime:", "qcount:", "qconfirm") + _QUIZ_CB_PREFIX, "quiz"),
+    (("menu:participants",), "participants"),
+    (("menu:stats", "menu:score_manage", "score:"), "stats"),
+    (("menu:history",), "history"),
+    (("menu:settings", "settings:", "menu:score_formula", "formula:"), "settings"),
+    (("restore:",), "backup"),
+    (("menu:admins", "admin:"), MAIN_ONLY),
+)
+
+_STATE_PERMS = {
+    "add_topic": "topics", "rename_topic": "topics",
+    "edit_question_text": "questions", "add_question_text": "questions",
+    "add_question_opt_a": "questions", "add_question_opt_b": "questions",
+    "add_question_opt_c": "questions", "add_question_opt_d": "questions",
+    "add_question_correct": "questions", "quiz_setup": "quiz",
+    "score_add_amount": "stats", "score_sub_amount": "stats",
+    "edit_formula": "settings", "add_admin_id": MAIN_ONLY,
+    "restore_wait_file": "backup", "restore_confirm": "backup",
+}
+
+
+def _callback_class(data: str) -> str:
+    if data in _PUBLIC_CB_EXACT or data.startswith(_PUBLIC_CB_PREFIX):
+        return "public"
+    if data.startswith(_QUIZ_CB_PREFIX):
+        return "quiz"
+    return "panel"
+
+
+def _perm_for_callback(data: str) -> str | None:
+    for prefixes, perm in _CB_PERMS:
+        if data == prefixes[0] or data.startswith(prefixes):
+            return perm
+    return None
+
+
+def _markup_is_panel(markup: dict) -> bool:
+    for row in markup.get("inline_keyboard", []):
+        for b in row:
+            if _callback_class(b.get("callback_data", "")) == "panel":
+                return True
+    return False
+
+
+def _register_panel(chat_id: int, message_id: int, owner: int) -> None:
+    with _panel_lock:
+        _panel_owners[(chat_id, message_id)] = owner
+        _panel_owners.move_to_end((chat_id, message_id))
+        while len(_panel_owners) > _PANEL_OWNERS_MAX:
+            _panel_owners.popitem(last=False)
+
+
+def _panel_owner(chat_id: int, message_id: int) -> int | None:
+    with _panel_lock:
+        return _panel_owners.get((chat_id, message_id))
+
+
+def _perm_denial(user_id: int, perm: str | None) -> str | None:
+    if perm is None:
+        return None
+    if perm == MAIN_ONLY:
+        return None if user_id in ADMIN_IDS else MSG_MAIN_ONLY
+    return None if has_perm(user_id, perm) else MSG_NO_PERM
+
+
+def _callback_denied(data: str, chat_id: int, user_id: int, message_id: int | None) -> str | None:
+    """اگر این کاربر نباید بتواند این دکمه را بزند، متن خطا را برمی‌گرداند؛ وگرنه None."""
+    cls = _callback_class(data)
+    if cls == "public":
+        return None
+    if not is_admin(user_id):
+        return MSG_NOT_ADMIN
+    if cls == "quiz":
+        try:
+            quiz = db.get_quiz(int(data.split(":")[1]))
+        except (ValueError, IndexError):
+            quiz = None
+        if quiz is not None and quiz["created_by"] != user_id:
+            return MSG_QUIZ_OTHER
+    elif chat_id != user_id:   # گروه: پنل فقط مال صاحبش است (در چت خصوصی فقط خود شخص هست)
+        owner = _panel_owner(chat_id, message_id) if message_id is not None else None
+        if owner is None:
+            return MSG_PANEL_EXPIRED
+        if owner != user_id:
+            return MSG_PANEL_OTHER
+    return _perm_denial(user_id, _perm_for_callback(data))
+
+
+def _state_denied(user_id: int, state_name: str) -> str | None:
+    if not is_admin(user_id):
+        return MSG_NOT_ADMIN
+    return _perm_denial(user_id, _STATE_PERMS.get(state_name))
 
 
 def display_name_of(user: dict) -> str:
@@ -222,17 +431,27 @@ def kb(*rows: list[dict]) -> dict:
     return {"inline_keyboard": list(rows)}
 
 
-def main_admin_menu() -> dict:
-    return kb(
-        [btn("📚 مدیریت مباحث", "menu:topics_sections")],
-        [btn("❓ مدیریت سوالات", "menu:questions_sections")],
-        [btn("🏆 برگزاری کوییز", "menu:new_quiz")],
-        [btn("👥 شرکت‌کنندگان", "menu:participants")],
-        [btn("📊 آمار و امتیازات", "menu:stats")],
-        [btn("🗂 سوابق کوییزها", "menu:history")],
-        [btn("👤 مدیریت ادمین‌ها", "menu:admins")],
-        [btn("⚙️ تنظیمات", "menu:settings")],
-    )
+def main_admin_menu(viewer_id: int | None = None) -> dict:
+    # فقط بخش‌هایی که این ادمین به آن‌ها دسترسی دارد نمایش داده می‌شود
+    def allowed(perm: str) -> bool:
+        return viewer_id is None or has_perm(viewer_id, perm)
+
+    rows = []
+    for perm, text, data in (
+        ("topics", "📚 مدیریت مباحث", "menu:topics_sections"),
+        ("questions", "❓ مدیریت سوالات", "menu:questions_sections"),
+        ("quiz", "🏆 برگزاری کوییز", "menu:new_quiz"),
+        ("participants", "👥 شرکت‌کنندگان", "menu:participants"),
+        ("stats", "📊 آمار و امتیازات", "menu:stats"),
+        ("history", "🗂 سوابق کوییزها", "menu:history"),
+    ):
+        if allowed(perm):
+            rows.append([btn(text, data)])
+    if viewer_id is None or viewer_id in ADMIN_IDS:
+        rows.append([btn("👤 مدیریت ادمین‌ها", "menu:admins")])
+    if allowed("settings"):
+        rows.append([btn("⚙️ تنظیمات", "menu:settings")])
+    return kb(*rows)
 
 
 def sections_menu(prefix: str) -> dict:
@@ -336,16 +555,37 @@ def teacher_control_panel(quiz_id: int, paused: bool) -> dict:
     return kb([btn("⏭ سؤال بعدی", f"next:{quiz_id}"), pause_btn], [btn("🛑 لغو کوییز", f"cancel:{quiz_id}")])
 
 
-def admins_menu() -> dict:
+def admins_menu(viewer_id: int | None = None) -> dict:
+    # دکمه‌های اختیارات فقط برای ادمین‌های ثابت (.env) نمایش داده می‌شود
+    show_perms = viewer_id is not None and viewer_id in ADMIN_IDS
     rows = []
     for uid in db.list_admin_ids():
         if uid in ADMIN_IDS:
             rows.append([btn(f"🔒 {uid} (ثابت)", "noop")])
         else:
             rows.append([btn(f"👤 {uid}", "noop"), btn("❌ حذف", f"admin:remove:{uid}")])
+            if show_perms:
+                rows.append([btn("🔐 دسترسی‌ها", f"admin:perms:{uid}")])
     rows.append([btn("➕ افزودن ادمین جدید", "admin:add")])
     rows.append([btn("🔙 بازگشت", "menu:main")])
     return kb(*rows)
+
+
+def admin_perms_menu(target_id: int) -> dict:
+    rows = []
+    for perm in db.ADMIN_PERMISSIONS:
+        allowed = db.admin_perm_allowed(target_id, perm)
+        rows.append([btn(f"{PERM_LABELS[perm]}: {'✅' if allowed else '🚫'}", f"admin:perm:{target_id}:{perm}")])
+    rows.append([btn("✅ فعال‌کردن همه", f"admin:permall:{target_id}:1"),
+                 btn("🚫 غیرفعال‌کردن همه", f"admin:permall:{target_id}:0")])
+    rows.append([btn("🔙 بازگشت", "menu:admins")])
+    return kb(*rows)
+
+
+def admin_perms_text(target_id: int) -> str:
+    u = db.get_user(target_id)
+    who = f"{u['display_name']} ({target_id})" if u else str(target_id)
+    return f"🔐 دسترسی‌های ادمین {who}\n\nبا زدن هر مورد، دسترسی آن بخش برای این ادمین روشن/خاموش می‌شود."
 
 
 def stats_menu_keyboard() -> dict:
@@ -865,10 +1105,24 @@ def handle_message(msg: dict) -> None:
             # بخش مدیریتی دسترسی ندارند - فقط همین پیام را می‌بینند.
             send_message(chat_id, "⛔️ این بخش فقط برای ادمین‌ها و استاده.")
             return
-        send_message(chat_id, "🪄 پنل مدیریت", main_admin_menu())
+        send_message(chat_id, "🪄 پنل مدیریت", main_admin_menu(user_id))
+        return
+
+    if command in ("/backup", "/restore"):
+        _handle_backup_restore_command(command, msg, chat_id, user_id)
         return
 
     state = get_state(chat_id, user_id)
+    if state:
+        denied = _state_denied(user_id, state["name"])
+        if denied:
+            _drop_restore_state(chat_id, user_id)
+            clear_state(chat_id, user_id)
+            send_message(chat_id, denied)
+            return
+    if state and msg.get("document") and state["name"] == "restore_wait_file":
+        _handle_restore_document(chat_id, user_id, msg["document"])
+        return
     if state:
         _handle_fsm_message(chat_id, user_id, state, text)
 
@@ -938,7 +1192,7 @@ def _handle_fsm_message(chat_id: int, user_id: int, state: dict, text: str) -> N
         added = db.add_admin(new_admin_id)
         clear_state(chat_id, user_id)
         msg = f"✅ کاربر {new_admin_id} به ادمین‌ها اضافه شد." if added else "ℹ️ این کاربر از قبل ادمین بود."
-        send_message(chat_id, msg, admins_menu())
+        send_message(chat_id, msg, admins_menu(user_id))
 
     elif name in ("score_add_amount", "score_sub_amount"):
         try:
@@ -980,6 +1234,203 @@ def _handle_fsm_message(chat_id: int, user_id: int, state: dict, text: str) -> N
             score_formula_menu(),
         )
 
+    elif name == "restore_wait_file":
+        send_message(
+            chat_id, "📎 لطفاً فایل zip بک‌آپ را به‌صورت فایل (Document) بفرست.",
+            kb([btn("❌ انصراف", "restore:cancel")]),
+        )
+
+
+# --------------------------------------------------------------------- #
+# Backup / Restore (فقط چت خصوصی)
+# --------------------------------------------------------------------- #
+
+MAX_SEND_ZIP_BYTES = 49 * 1024 * 1024      # سقف ارسال فایل توسط Bot API (۵۰ مگابایت)
+
+
+def _handle_backup_restore_command(command: str, msg: dict, chat_id: int, user_id: int) -> None:
+    if not is_admin(user_id):
+        send_message(chat_id, "⛔️ این بخش فقط برای ادمین‌ها و استاده.")
+        return
+    if msg["chat"].get("type") != "private":
+        send_message(chat_id, "🔒 این دستور فقط در چت خصوصی با ربات کار می‌کند.")
+        return
+    if not can_backup(user_id):
+        send_message(chat_id, "⛔️ دسترسی بک‌آپ/ریستور برای شما غیرفعال شده است.")
+        return
+    if command == "/backup":
+        _do_backup(chat_id)
+    else:
+        _start_restore(chat_id, user_id)
+
+
+def _do_backup(chat_id: int) -> None:
+    note = send_message(chat_id, "⏳ در حال ساخت بک‌آپ...")
+    tmp_dir = tempfile.mkdtemp(prefix="quizbot_backup_")
+    try:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        zip_path = db.create_backup_zip(tmp_dir, stamp)
+        if os.path.getsize(zip_path) > MAX_SEND_ZIP_BYTES:
+            send_message(chat_id, "❌ حجم بک‌آپ از سقف ارسال تلگرام (۵۰ مگابایت) بیشتر است.")
+            return
+        result = send_document(
+            chat_id, zip_path, os.path.basename(zip_path),
+            f"💾 بک‌آپ دیتابیس ({stamp} UTC)\nبرای بازگردانی: /restore",
+        )
+        if result is None:
+            send_message(chat_id, "❌ ارسال فایل بک‌آپ ناموفق بود. دوباره تلاش کن.")
+        elif note:
+            delete_message(chat_id, note["message_id"])
+    except Exception:
+        log.exception("backup failed")
+        send_message(chat_id, "❌ ساخت بک‌آپ با خطا مواجه شد.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _drop_restore_state(chat_id: int, user_id: int) -> None:
+    st = get_state(chat_id, user_id)
+    if st and st.get("name") in ("restore_wait_file", "restore_confirm"):
+        if st.get("tmp_dir"):
+            shutil.rmtree(st["tmp_dir"], ignore_errors=True)
+        clear_state(chat_id, user_id)
+
+
+def _start_restore(chat_id: int, user_id: int) -> None:
+    _drop_restore_state(chat_id, user_id)
+    set_state(chat_id, user_id, "restore_wait_file")
+    send_message(
+        chat_id,
+        "♻️ ریستور دیتابیس\n\nفایل zip بک‌آپ را همین‌جا بفرست.\n\n"
+        "⚠️ بعد از تأییدِ نهایی، دیتابیس فعلی کاملاً از ولوم حذف و با دیتابیس داخل فایل جایگزین می‌شود.",
+        kb([btn("❌ انصراف", "restore:cancel")]),
+    )
+
+
+def _open_quizzes_warning(open_quizzes: list[dict]) -> str:
+    return (
+        f"\n\n🚨 الان {len(open_quizzes)} کوییز نیمه‌کاره/در جریان وجود دارد "
+        "(در انتظار بازیکن یا در حال اجرا). با ریستور این کوییزها لغو می‌شوند و از بین می‌روند."
+    )
+
+
+def _handle_restore_document(chat_id: int, user_id: int, doc: dict) -> None:
+    if pop_state_if(chat_id, user_id, "restore_wait_file") is None:
+        return
+    name = (doc.get("file_name") or "")
+    if not name.lower().endswith(".zip"):
+        set_state(chat_id, user_id, "restore_wait_file")
+        send_message(chat_id, "❌ فقط فایل zip قابل قبول است. دوباره بفرست:", kb([btn("❌ انصراف", "restore:cancel")]))
+        return
+
+    send_message(chat_id, "⏳ در حال دریافت و بررسی فایل...")
+    tmp_dir = tempfile.mkdtemp(prefix="quizbot_restore_")
+    zip_path = os.path.join(tmp_dir, "upload.zip")
+    if not download_telegram_file(doc["file_id"], zip_path):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        set_state(chat_id, user_id, "restore_wait_file")
+        send_message(
+            chat_id,
+            "❌ دریافت فایل ناموفق بود. دوباره بفرست.\n\n"
+            "ℹ️ اگر حجم فایل بیشتر از ۲۰ مگابایت است، این محدودیتِ خودِ تلگرام است: "
+            "Bot API رسمی اجازه‌ی دانلود فایل بزرگ‌تر را به ربات‌ها نمی‌دهد.",
+            kb([btn("❌ انصراف", "restore:cancel")]),
+        )
+        return
+    try:
+        db_path, info = db.extract_backup_zip(zip_path, tmp_dir)
+    except Exception:
+        log.exception("restore validation crashed")
+        db_path, info = None, "بررسی فایل با خطا مواجه شد."
+    if db_path is None:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        set_state(chat_id, user_id, "restore_wait_file")
+        send_message(chat_id, f"❌ {info}\n\nفایل درست را بفرست یا انصراف بده.", kb([btn("❌ انصراف", "restore:cancel")]))
+        return
+    os.remove(zip_path)
+
+    open_quizzes = db.list_open_quizzes()
+    set_state(chat_id, user_id, "restore_confirm", tmp_dir=tmp_dir, db_path=db_path, ack_active=bool(open_quizzes))
+    text = (
+        "✅ فایل معتبر است.\n"
+        f"📦 محتوای بک‌آپ → {info}\n\n"
+        "⚠️ با تأیید، دیتابیس فعلی (همه‌ی کاربران، سؤال‌ها، نمره‌ها و تنظیمات) کاملاً حذف و "
+        "با این بک‌آپ جایگزین می‌شود. این کار برگشت‌پذیر نیست؛ اگر لازم است اول /backup بگیر."
+    )
+    if open_quizzes:
+        text += _open_quizzes_warning(open_quizzes)
+        confirm_label = "⚠️ بله، کوییزها لغو شوند و ریستور انجام شود"
+    else:
+        confirm_label = "✅ بله، ریستور کن"
+    send_message(chat_id, text, kb([btn(confirm_label, "restore:confirm")], [btn("❌ انصراف", "restore:cancel")]))
+
+
+def _stop_running_quizzes() -> None:
+    with _active_lock:
+        running = list(_threads.items())
+    for quiz_id, _t in running:
+        cancel_quiz(quiz_id)
+    for quiz_id, t in running:
+        t.join(timeout=15)
+        if t.is_alive():
+            log.warning("quiz thread %s did not stop in time before restore", quiz_id)
+
+
+def _confirm_restore(chat_id: int, user_id: int, message_id: int, cq_id: str) -> None:
+    st = get_state(chat_id, user_id)
+    if not st or st["name"] != "restore_confirm":
+        answer_callback_query(cq_id, "⌛️ این درخواست منقضی شده؛ دوباره /restore بزن.", show_alert=True)
+        return
+    if chat_id != user_id or not can_backup(user_id):
+        answer_callback_query(cq_id, "⛔️ دسترسی بک‌آپ/ریستور برای شما فعال نیست.", show_alert=True)
+        return
+
+    open_quizzes = db.list_open_quizzes()
+    if open_quizzes and not st.get("ack_active"):
+        # بین نمایش تأیید و کلیک، کوییزی شروع شده؛ یک‌بار دیگر صریح می‌پرسیم.
+        update_state(chat_id, user_id, ack_active=True)
+        edit_message_text(
+            chat_id, message_id,
+            "⚠️ در فاصله‌ی ارسال فایل تا حالا کوییزی شروع شده است." + _open_quizzes_warning(open_quizzes)
+            + "\n\nریستور انجام شود؟",
+            kb([btn("⚠️ بله، کوییزها لغو شوند و ریستور انجام شود", "restore:confirm")],
+               [btn("❌ انصراف", "restore:cancel")]),
+        )
+        answer_callback_query(cq_id)
+        return
+
+    st = pop_state_if(chat_id, user_id, "restore_confirm")
+    if st is None:   # دوبار کلیک پشت‌سرهم
+        answer_callback_query(cq_id)
+        return
+    answer_callback_query(cq_id, "⏳ در حال ریستور...")
+    edit_message_text(chat_id, message_id, "⏳ در حال ریستور دیتابیس...")
+    try:
+        _stop_running_quizzes()
+        db.replace_database_file(st["db_path"])
+        db.init_db()
+        db.seed_admins_from_env(ADMIN_IDS)
+        cancelled = db.cancel_all_open_quizzes()
+        with _state_lock:
+            _states.clear()
+        conn = db.get_conn()
+        counts = (
+            conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0],
+        )
+        text = (
+            "✅ ریستور انجام شد. دیتابیس قبلی حذف و فضایش از ولوم آزاد شد.\n"
+            f"👥 کاربران: {counts[0]} | ❓ سؤال‌ها: {counts[1]}"
+        )
+        if cancelled:
+            text += f"\n🛑 {cancelled} کوییز نیمه‌کاره‌ی داخل بک‌آپ لغو شد."
+        edit_message_text(chat_id, message_id, text)
+    except Exception:
+        log.exception("restore failed")
+        edit_message_text(chat_id, message_id, "❌ ریستور با خطا مواجه شد. لاگ‌ها را بررسی کن و وضعیت دیتابیس را چک کن.")
+    finally:
+        shutil.rmtree(st["tmp_dir"], ignore_errors=True)
+
 
 # --------------------------------------------------------------------- #
 # Handlerهای Callback (دکمه‌ها)
@@ -1007,6 +1458,10 @@ def handle_callback(cq: dict) -> None:
         return True
 
     try:
+        denied = _callback_denied(data, chat_id, user_id, message_id)
+        if denied:
+            answer_callback_query(cq_id, denied, show_alert=True)
+            return
         _dispatch_callback(data, chat_id, user_id, message_id, cq_id, require_admin)
     except Exception:
         log.exception("Error handling callback %s", data)
@@ -1022,7 +1477,7 @@ def _dispatch_callback(data, chat_id, user_id, message_id, cq_id, require_admin)
         clear_state(chat_id, user_id)
         if not require_admin():
             return
-        edit_message_text(chat_id, message_id, "🪄 پنل مدیریت", main_admin_menu())
+        edit_message_text(chat_id, message_id, "🪄 پنل مدیریت", main_admin_menu(user_id))
         answer_callback_query(cq_id)
 
     elif data == "menu:topics_sections":
@@ -1551,7 +2006,7 @@ def _dispatch_callback(data, chat_id, user_id, message_id, cq_id, require_admin)
     elif data == "menu:admins":
         if not require_admin():
             return
-        edit_message_text(chat_id, message_id, "👤 مدیریت ادمین‌ها\n\nادمین‌های ثابت (🔒) از طریق فایل .env تنظیم می‌شوند و از اینجا قابل حذف نیستند.", admins_menu())
+        edit_message_text(chat_id, message_id, "👤 مدیریت ادمین‌ها\n\nادمین‌های ثابت (🔒) از طریق فایل .env تنظیم می‌شوند و از اینجا قابل حذف نیستند.", admins_menu(user_id))
         answer_callback_query(cq_id)
 
     elif data == "admin:add":
@@ -1569,8 +2024,59 @@ def _dispatch_callback(data, chat_id, user_id, message_id, cq_id, require_admin)
             answer_callback_query(cq_id, "🔒 این ادمین ثابت است و از داخل ربات قابل حذف نیست.", show_alert=True)
             return
         db.remove_admin(target_id)
-        edit_message_text(chat_id, message_id, "👤 مدیریت ادمین‌ها", admins_menu())
+        edit_message_text(chat_id, message_id, "👤 مدیریت ادمین‌ها", admins_menu(user_id))
         answer_callback_query(cq_id, "✅ حذف شد.")
+
+    elif data.startswith("admin:perms:"):
+        if user_id not in ADMIN_IDS:
+            answer_callback_query(cq_id, MSG_MAIN_ONLY, show_alert=True)
+            return
+        target_id = int(data.split(":")[2])
+        if target_id in ADMIN_IDS or not db.is_admin_id(target_id):
+            answer_callback_query(cq_id, "این مورد قابل تغییر نیست.", show_alert=True)
+            return
+        edit_message_text(chat_id, message_id, admin_perms_text(target_id), admin_perms_menu(target_id))
+        answer_callback_query(cq_id)
+
+    elif data.startswith("admin:perm:"):
+        if user_id not in ADMIN_IDS:
+            answer_callback_query(cq_id, MSG_MAIN_ONLY, show_alert=True)
+            return
+        parts = data.split(":")
+        target_id, perm = int(parts[2]), parts[3]
+        if target_id in ADMIN_IDS or not db.is_admin_id(target_id) or perm not in db.ADMIN_PERMISSIONS:
+            answer_callback_query(cq_id, "این مورد قابل تغییر نیست.", show_alert=True)
+            return
+        db.set_admin_perm(target_id, perm, not db.admin_perm_allowed(target_id, perm))
+        edit_message_text(chat_id, message_id, admin_perms_text(target_id), admin_perms_menu(target_id))
+        answer_callback_query(cq_id, "✅ به‌روزرسانی شد.")
+
+    elif data.startswith("admin:permall:"):
+        if user_id not in ADMIN_IDS:
+            answer_callback_query(cq_id, MSG_MAIN_ONLY, show_alert=True)
+            return
+        parts = data.split(":")
+        target_id, flag = int(parts[2]), parts[3] == "1"
+        if target_id in ADMIN_IDS or not db.is_admin_id(target_id):
+            answer_callback_query(cq_id, "این مورد قابل تغییر نیست.", show_alert=True)
+            return
+        for perm in db.ADMIN_PERMISSIONS:
+            db.set_admin_perm(target_id, perm, flag)
+        edit_message_text(chat_id, message_id, admin_perms_text(target_id), admin_perms_menu(target_id))
+        answer_callback_query(cq_id, "✅ به‌روزرسانی شد.")
+
+    # ---------------- ریستور دیتابیس ---------------- #
+    elif data == "restore:cancel":
+        if not require_admin():
+            return
+        _drop_restore_state(chat_id, user_id)
+        edit_message_text(chat_id, message_id, "❎ ریستور لغو شد.")
+        answer_callback_query(cq_id)
+
+    elif data == "restore:confirm":
+        if not require_admin():
+            return
+        _confirm_restore(chat_id, user_id, message_id, cq_id)
 
 
     else:
@@ -1643,11 +2149,15 @@ def _write_offset(offset: int) -> None:
 def handle_update(update: dict) -> None:
     try:
         if "message" in update:
+            _ctx.actor = (update["message"].get("from") or {}).get("id")
             handle_message(update["message"])
         elif "callback_query" in update:
+            _ctx.actor = update["callback_query"]["from"]["id"]
             handle_callback(update["callback_query"])
     except Exception:
         log.exception("Error processing update")
+    finally:
+        _ctx.actor = None
 
 
 def main() -> None:
