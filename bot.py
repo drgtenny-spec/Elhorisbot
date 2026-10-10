@@ -56,7 +56,9 @@ if not BOT_TOKEN:
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip()
 }
-TIMER_UPDATE_INTERVAL = int(os.environ.get("TIMER_UPDATE_INTERVAL", "3"))
+# هر چه ویرایش پیام تایمر بیشتر باشد، تلگرام (محدودیت ~۲۰ پیام در دقیقه برای هر گروه)
+# خطای 429 می‌دهد و تایمر/سؤال بعدی گیر می‌کرد؛ پس حداقل ۵ ثانیه.
+TIMER_UPDATE_INTERVAL = max(5, int(os.environ.get("TIMER_UPDATE_INTERVAL", "5") or "5"))
 PAUSE_BETWEEN_QUESTIONS = 2.5
 OFFSET_FILE = os.environ.get("OFFSET_FILE", "offset.txt")
 
@@ -69,6 +71,10 @@ log = logging.getLogger("quizbot")
 TIME_OPTIONS = [10, 15, 20, 30]
 COUNT_OPTIONS = [1, 5, 10, 15, 20]
 OPTION_LABELS = ["A", "B", "C", "D"]
+MAX_QUESTION_LEN = 1000     # سقف طول متن سؤال (پیام تلگرام حداکثر ۴۰۹۶ کاراکتر است)
+MAX_OPTION_LEN = 200        # سقف طول هر گزینه
+MAX_TOPIC_LEN = 100
+TG_TEXT_LIMIT = 4000
 
 # --------------------------------------------------------------------- #
 # کلاینت مینیمال Telegram Bot API - فقط با urllib (بدون requests/aiohttp)
@@ -77,33 +83,79 @@ OPTION_LABELS = ["A", "B", "C", "D"]
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
 
-def api(method: str, _request_timeout: int = 20, **params) -> dict | list | None:
+_flood_lock = threading.Lock()
+_flood_until = 0.0          # تا این لحظه (monotonic) تلگرام گفته آرام باشیم (429)
+
+
+def _note_flood(seconds: float) -> None:
+    global _flood_until
+    with _flood_lock:
+        _flood_until = max(_flood_until, time.monotonic() + seconds)
+
+
+def _flood_remaining() -> float:
+    with _flood_lock:
+        return max(0.0, _flood_until - time.monotonic())
+
+
+def api(method: str, _request_timeout: int = 20, _retries: int = 1, **params) -> dict | list | None:
+    """فراخوانی Bot API. روی خطای شبکه / 5xx / 429 (flood) تا _retries بار دوباره
+    تلاش می‌کند و برای 429 دقیقاً retry_after تلگرام را صبر می‌کند. قبلاً هر خطای
+    لحظه‌ای = ارسال نشدن بی‌صدای پیام = گیر کردن کوییز روی یک سؤال."""
     url = API_BASE + method
     body = json.dumps(params).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=_request_timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
+    attempts = max(1, _retries)
+    for attempt in range(1, attempts + 1):
+        payload = None
+        transient = False
+        retry_after = None
         try:
-            payload = json.loads(exc.read().decode("utf-8"))
-        except Exception:
-            log.warning("HTTP error calling %s: %s", method, exc)
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=_request_timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                payload = json.loads(exc.read().decode("utf-8"))
+            except Exception:
+                log.warning("HTTP error calling %s: %s", method, exc)
+                transient = exc.code >= 500
+        except Exception as exc:
+            log.warning("Network error calling %s: %s", method, type(exc).__name__)
+            transient = True
+
+        if isinstance(payload, dict):
+            if payload.get("ok"):
+                return payload.get("result")
+            code = payload.get("error_code")
+            desc = str(payload.get("description", ""))
+            if code == 429:
+                try:
+                    retry_after = float((payload.get("parameters") or {}).get("retry_after", 3))
+                except (TypeError, ValueError):
+                    retry_after = 3.0
+                _note_flood(retry_after)
+                transient = True
+                log.warning("Telegram flood control on %s: retry after %.0fs", method, retry_after)
+            elif isinstance(code, int) and code >= 500:
+                transient = True
+            elif "not modified" not in desc:
+                if method == "getUpdates":
+                    log.warning("Telegram API error on %s: %s", method, desc)
+                else:
+                    log.debug("Telegram API error on %s: %s", method, desc)
+        elif payload is not None:
+            transient = False
+
+        if not transient or attempt >= attempts:
             return None
-    except Exception as exc:
-        log.warning("Network error calling %s: %s", method, exc)
-        return None
-
-    if not payload.get("ok"):
-        if "not modified" not in str(payload.get("description", "")):
-            log.debug("Telegram API error on %s: %s", method, payload)
-        return None
-    return payload.get("result")
+        time.sleep(min(30.0, (retry_after + 0.5) if retry_after else 1.5 * attempt))
+    return None
 
 
-def get_updates(offset: int, poll_timeout: int = 30) -> list:
+def get_updates(offset: int, poll_timeout: int = 30) -> list | None:
+    """None یعنی خطا (تا حلقه‌ی اصلی بداند باید کمی صبر کند)، [] یعنی آپدیت جدیدی نیست."""
     result = api(
         "getUpdates",
         _request_timeout=poll_timeout + 10,
@@ -111,14 +163,43 @@ def get_updates(offset: int, poll_timeout: int = 30) -> list:
         timeout=poll_timeout,
         allowed_updates=["message", "callback_query"],
     )
-    return result or []
+    return result if isinstance(result, list) else None
 
 
-def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> dict | None:
-    payload = {"chat_id": chat_id, "text": text}
+def _clip(text: str, limit: int = TG_TEXT_LIMIT) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def split_long_text(text: str, limit: int = 3800) -> list[str]:
+    """متن بلند را روی مرز خط به چند پیام ≤ limit کاراکتر تقسیم می‌کند."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    cur = ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(cur) + len(line) + 1 > limit and cur:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def send_message(chat_id: int, text: str, reply_markup: dict | None = None, retries: int = 4) -> dict | None:
+    payload = {"chat_id": chat_id, "text": _clip(text)}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
-    result = api("sendMessage", **payload)
+    result = api("sendMessage", _retries=retries, **payload)
+    if result is None:
+        log.warning("sendMessage to %s failed after %d attempt(s)", chat_id, retries)
     if result and reply_markup is not None:
         actor = getattr(_ctx, "actor", None)
         if actor is not None and _markup_is_panel(reply_markup):
@@ -126,11 +207,22 @@ def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> d
     return result
 
 
-def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None):
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+def send_long(chat_id: int, text: str, reply_markup: dict | None = None) -> dict | None:
+    """مثل send_message ولی متن بلند (مثلاً جدول امتیاز کلاس شلوغ) را تکه‌تکه می‌فرستد
+    تا از سقف ۴۰۹۶ کاراکتر تلگرام رد نشود و پیام بی‌صدا گم نشود."""
+    parts = split_long_text(text)
+    last = None
+    for i, part in enumerate(parts):
+        last = send_message(chat_id, part, reply_markup if i == len(parts) - 1 else None)
+    return last
+
+
+def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None,
+                      retries: int = 1):
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": _clip(text)}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
-    return api("editMessageText", **payload)
+    return api("editMessageText", _retries=retries, **payload)
 
 
 def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup: dict):
@@ -546,7 +638,10 @@ def question_options_keyboard(quiz_question_id: int, question: dict, closed: boo
     rows = []
     for opt in question["options"]:
         cb = "closed" if closed else f"ans:{quiz_question_id}:{opt['id']}"
-        rows.append([btn(f"🔘 {opt['label']}) {opt['text']}", cb)])
+        label_text = (opt["text"] or "").strip() or "—"     # دکمه‌ی با متن خالی = خطای تلگرام
+        if len(label_text) > 50:
+            label_text = label_text[:49] + "…"
+        rows.append([btn(f"🔘 {opt['label']}) {label_text}", cb)])
     return kb(*rows)
 
 
@@ -668,9 +763,11 @@ def format_participants_block(participants: list[dict]) -> str:
     if not participants:
         return "هنوز کسی ثبت‌نام نکرده ✨"
     lines = []
-    for i, p in enumerate(participants):
+    for i, p in enumerate(participants[:60]):
         icon = medal_for_rank(i) if i < 2 else "🔸"
         lines.append(f"{icon} {p['display_name']}")
+    if len(participants) > 60:
+        lines.append(f"… و {len(participants) - 60} نفر دیگر")
     return "\n".join(lines)
 
 
@@ -865,6 +962,29 @@ def cancel_quiz(quiz_id: int) -> None:
     db.set_status(quiz_id, "cancelled")
 
 
+def blocking_quiz_for_chat(chat_id: int) -> dict | None:
+    """کوییز فعالِ واقعی این چت. کوییزهایی که در دیتابیس «در حال اجرا» هستند ولی هیچ
+    ترد زنده‌ای ندارند (کرش/قطعی)، یا کوییز منتظرِ بازیکنِ خیلی قدیمی، لغو می‌شوند
+    تا گروه برای همیشه قفل نماند."""
+    active = db.get_active_quiz_for_chat(chat_id)
+    if not active:
+        return None
+    status = active["status"]
+    if status in ("running", "question_active", "question_finished") and not is_running(active["id"]):
+        log.warning("quiz %s was stuck in %s without a thread - cancelling", active["id"], status)
+        db.set_status(active["id"], "cancelled")
+        return None
+    if status == "waiting_for_players":
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(active["created_at"])).total_seconds()
+        except (TypeError, ValueError):
+            age = 0
+        if age > 6 * 3600:
+            db.set_status(active["id"], "cancelled")
+            return None
+    return active
+
+
 def _select_question_ids(quiz: dict) -> list[int]:
     questions = db.list_questions(quiz["topic_id"])
     random.shuffle(questions)
@@ -877,10 +997,12 @@ def start_quiz(quiz_id: int) -> None:
         if quiz_id in _threads:
             return
     quiz = db.get_quiz(quiz_id)
-    if not quiz:
+    if not quiz or quiz["status"] != "waiting_for_players":
         return
     question_ids = _select_question_ids(quiz)
     if not question_ids:
+        db.set_status(quiz_id, "cancelled")
+        send_message(quiz["chat_id"], "⚠️ این مبحث دیگر سؤالی ندارد؛ کوییز لغو شد.")
         return
     db.build_quiz_questions(quiz_id, question_ids, quiz["question_time_seconds"])
     db.set_status(quiz_id, "running")
@@ -890,17 +1012,76 @@ def start_quiz(quiz_id: int) -> None:
     t.start()
 
 
+MAX_QUESTION_ATTEMPTS = 2          # هر سؤال حداکثر چند بار برای «ارسال» تلاش شود
+MAX_CONSECUTIVE_SKIPS = 3          # اگر پشت‌سرهم این‌قدر سؤال رد شد (قطعی اینترنت)، کوییز متوقف می‌شود
+
+
 def _run_quiz(quiz_id: int, start_order: int) -> None:
+    """حلقه‌ی اصلی کوییز. هر سؤال جداگانه محافظت می‌شود: اگر یک سؤال به هر دلیل
+    (متن نامعتبر، خطای تلگرام، باگ) نتواند اجرا شود، کوییز «بی‌صدا نمی‌میرد»؛ یا
+    همان سؤال دوباره امتحان می‌شود یا رد می‌شود و ادامه می‌دهد. فقط اگر چند سؤال
+    پشت‌سرهم شکست بخورند (مثلاً اینترنت قطع است) کوییز با پیام مشخص متوقف می‌شود."""
+    ended_cleanly = False
     try:
         order = start_order
+        attempts_for_order = 0
+        consecutive_skips = 0
         while True:
-            outcome = _run_single_question(quiz_id, order)
+            try:
+                outcome = _run_single_question(quiz_id, order)
+            except Exception:
+                log.exception("question %s of quiz %s crashed", order, quiz_id)
+                outcome = "failed"
+                qq = db.get_quiz_question_by_order(quiz_id, order)
+                if qq is not None and qq["started_at"] is not None:
+                    # سؤال قبلاً برای بچه‌ها ارسال شده؛ دوباره‌پرسیدنش درست نیست.
+                    db.mark_question_finished(qq["id"])
+                    outcome = "skipped"
+
             if outcome == "no_more":
                 _finish_quiz(quiz_id)
+                ended_cleanly = True
+                break
+            if outcome == "stop":
+                ended_cleanly = True
                 break
             if outcome == "cancelled":
+                db.set_status(quiz_id, "cancelled")
                 _announce_cancelled(quiz_id)
+                ended_cleanly = True
                 break
+
+            if outcome == "ok":
+                consecutive_skips = 0
+                attempts_for_order = 0
+            elif outcome == "skipped":
+                consecutive_skips += 1
+                attempts_for_order = 0
+            else:  # "failed" - سؤال اصلاً ارسال نشد
+                attempts_for_order += 1
+                if attempts_for_order < MAX_QUESTION_ATTEMPTS:
+                    time.sleep(3)
+                    continue            # همان سؤال را دوباره امتحان کن
+                qq = db.get_quiz_question_by_order(quiz_id, order)
+                if qq is not None:
+                    db.mark_question_finished(qq["id"])
+                log.error("quiz %s: question %s skipped after %d failed attempts", quiz_id, order, attempts_for_order)
+                consecutive_skips += 1
+                attempts_for_order = 0
+
+            if consecutive_skips >= MAX_CONSECUTIVE_SKIPS:
+                log.error("quiz %s aborted after %d consecutive skipped questions", quiz_id, consecutive_skips)
+                db.set_status(quiz_id, "cancelled")
+                quiz = db.get_quiz(quiz_id)
+                if quiz:
+                    send_message(
+                        quiz["chat_id"],
+                        "⚠️ به‌خاطر مشکل در ارتباط با تلگرام کوییز متوقف شد. "
+                        "بعد از برطرف شدن مشکل می‌توانی دوباره کوییز بسازی 🙏",
+                    )
+                ended_cleanly = True
+                break
+
             order += 1
             time.sleep(PAUSE_BETWEEN_QUESTIONS)
     except Exception:
@@ -909,6 +1090,17 @@ def _run_quiz(quiz_id: int, start_order: int) -> None:
         with _active_lock:
             _threads.pop(quiz_id, None)
             _controls.pop(quiz_id, None)
+        if not ended_cleanly:
+            # ترد به شکل غیرمنتظره تمام شد: وضعیت را در دیتابیس باز نگذار، وگرنه
+            # این گروه تا ابد «کوییز فعال» دارد و کوییز جدید نمی‌شود ساخت.
+            try:
+                if db.get_quiz_status(quiz_id) not in ("finished", "cancelled"):
+                    db.set_status(quiz_id, "cancelled")
+                    quiz = db.get_quiz(quiz_id)
+                    if quiz:
+                        send_message(quiz["chat_id"], "⚠️ کوییز به‌خاطر یک خطای فنی متوقف شد. لطفاً دوباره کوییز بساز.")
+            except Exception:
+                log.exception("failed to clean up quiz %s", quiz_id)
 
 
 def _shuffle_options_for_display(question: dict) -> dict:
@@ -920,18 +1112,37 @@ def _shuffle_options_for_display(question: dict) -> dict:
     random.shuffle(options)
     for i, opt in enumerate(options):
         opt["label"] = OPTION_LABELS[i] if i < len(OPTION_LABELS) else str(i + 1)
+        opt["text"] = (opt.get("text") or "").strip() or "—"
     shuffled = dict(question)
+    shuffled["text"] = (question.get("text") or "").strip() or "(سؤال بدون متن)"
     shuffled["options"] = options
     return shuffled
 
 
+def _question_is_playable(question: dict | None) -> bool:
+    if not question:
+        return False
+    opts = question.get("options") or []
+    return len(opts) >= 2 and any(o["is_correct"] for o in opts)
+
+
 def _run_single_question(quiz_id: int, order: int) -> str:
+    """نتیجه: ok | no_more | cancelled | stop | skipped | failed"""
     qq = db.get_quiz_question_by_order(quiz_id, order)
     if qq is None:
         return "no_more"
     quiz = db.get_quiz(quiz_id)
     if quiz is None or quiz["status"] == "cancelled":
         return "cancelled"
+    if quiz["status"] == "finished":
+        return "stop"
+    if qq["is_finished"]:
+        return "skipped"     # (مثلاً بعد از ریکاوری) این سؤال قبلاً تمام شده
+
+    if not _question_is_playable(qq["question"]):
+        log.warning("quiz %s: question %s is not playable (missing/invalid) - skipped", quiz_id, qq["question_id"])
+        db.mark_question_finished(qq["id"])
+        return "skipped"
 
     total = len(quiz["quiz_questions"])
     # این‌جا فقط برای نمایش (متن سؤال و دکمه‌ها) از نسخه‌ی شافل‌شده استفاده
@@ -939,16 +1150,21 @@ def _run_single_question(quiz_id: int, order: int) -> str:
     # امتیازدهی و تشخیص «کدام گزینه درست است» کاملاً درست کار می‌کند.
     question = _shuffle_options_for_display(qq["question"])
     duration = qq["duration_seconds"]
+    chat_id = quiz["chat_id"]
     keyboard = question_options_keyboard(qq["id"], question, closed=False)
-    msg = send_message(quiz["chat_id"], render_question_text(question, order + 1, total, duration), keyboard)
+    msg = send_message(chat_id, render_question_text(question, order + 1, total, duration), keyboard)
     if not msg:
-        return "cancelled"
+        return "failed"
     db.mark_question_started(qq["id"], msg["message_id"])
-    db.set_status(quiz_id, "question_active")
 
     control = QuizControl(duration)
     with _active_lock:
         _controls[quiz_id] = control
+    db.set_status(quiz_id, "question_active")
+    # اگر ادمین دقیقاً همین لحظه «لغو» را زده باشد (قبل از ثبت control)، فقط
+    # وضعیت دیتابیس عوض شده بود؛ اینجا حتماً می‌بینیمش.
+    if db.get_quiz_status(quiz_id) == "cancelled":
+        control.cancel()
 
     last_rendered = -1
     while True:
@@ -961,24 +1177,28 @@ def _run_single_question(quiz_id: int, order: int) -> str:
         if remaining <= 0:
             break
         rounded = int(remaining)
-        if rounded != last_rendered:
+        # وقتی تلگرام گفته آرام باش (429) ویرایش تایمر را رد می‌کنیم؛ زمان واقعی
+        # با ساعت خودمان محاسبه می‌شود پس سؤال سر وقت تمام می‌شود.
+        if rounded != last_rendered and _flood_remaining() <= 0:
             edit_message_text(
-                quiz["chat_id"], msg["message_id"],
+                chat_id, msg["message_id"],
                 render_question_text(question, order + 1, total, rounded), keyboard,
             )
             last_rendered = rounded
         time.sleep(min(TIMER_UPDATE_INTERVAL, max(0.5, remaining)))
 
     cancelled = control.cancelled
-    if not cancelled:
-        closed_kb = question_options_keyboard(qq["id"], question, closed=True)
-        edit_message_text(
-            quiz["chat_id"], msg["message_id"],
-            render_question_text(question, order + 1, total, 0), closed_kb,
-        )
+    # پیام سؤال همیشه (چه تمام شدن زمان، چه لغو) بسته می‌شود تا دکمه‌ها و تایمر
+    # روی صفحه گیر نکنند. این ویرایش مهم است، پس با retry انجام می‌شود.
+    closed_kb = question_options_keyboard(qq["id"], question, closed=True)
+    edit_message_text(
+        chat_id, msg["message_id"],
+        render_question_text(question, order + 1, total, 0), closed_kb, retries=3,
+    )
 
     with _active_lock:
-        _controls.pop(quiz_id, None)
+        if _controls.get(quiz_id) is control:
+            _controls.pop(quiz_id, None)
 
     if cancelled:
         return "cancelled"
@@ -987,7 +1207,7 @@ def _run_single_question(quiz_id: int, order: int) -> str:
     db.set_status(quiz_id, "question_finished")
     answers = db.answers_for_question(qq["id"])
     participants = db.list_participants(quiz_id)
-    send_message(quiz["chat_id"], render_result_text(question, answers, participants))
+    send_long(chat_id, render_result_text(question, answers, participants))
     return "ok"
 
 
@@ -1003,7 +1223,7 @@ def _finish_quiz(quiz_id: int) -> None:
     if participants:
         lines.append("")
         lines.append(f"🌟 نفر برتر: {participants[0]['display_name']}")
-    send_message(quiz["chat_id"], "\n".join(lines))
+    send_long(quiz["chat_id"], "\n".join(lines))
 
 
 def _announce_cancelled(quiz_id: int) -> None:
@@ -1020,6 +1240,11 @@ def recover_all() -> None:
             _recover_one(quiz_id)
         except Exception:
             log.exception("recovery failed for quiz %s", quiz_id)
+            try:
+                # کوییزی که نمی‌شود ریکاور کرد نباید گروه را برای همیشه قفل کند.
+                db.set_status(quiz_id, "cancelled")
+            except Exception:
+                pass
 
 
 def _recover_one(quiz_id: int) -> None:
@@ -1036,6 +1261,14 @@ def _recover_one(quiz_id: int) -> None:
 
     if current["started_at"] is not None:
         question = db.get_question(current["question_id"])
+        if question is None:
+            db.mark_question_finished(current["id"])
+            db.set_status(quiz_id, "running")
+            t = threading.Thread(target=_run_quiz, args=(quiz_id, current["order_index"] + 1), daemon=True)
+            with _active_lock:
+                _threads[quiz_id] = t
+            t.start()
+            return
         if current["message_id"]:
             try:
                 edit_message_text(
@@ -1049,7 +1282,7 @@ def _recover_one(quiz_id: int) -> None:
         answers = db.answers_for_question(current["id"])
         participants = db.list_participants(quiz_id)
         result_text = render_result_text(question, answers, participants)
-        send_message(
+        send_long(
             quiz["chat_id"],
             "♻️ ربات دوباره روشن شد، خیالت راحت هیچی از دست نرفت. کوییز همین‌جوری ادامه پیدا می‌کنه ✨\n\n" + result_text,
         )
@@ -1131,8 +1364,8 @@ def _handle_fsm_message(chat_id: int, user_id: int, state: dict, text: str) -> N
     name = state["name"]
 
     if name == "add_topic":
-        if not text:
-            send_message(chat_id, "❌ نام مبحث نمی‌تواند خالی باشد. دوباره ارسال کنید:")
+        if not text or len(text) > MAX_TOPIC_LEN:
+            send_message(chat_id, f"❌ نام مبحث باید غیرخالی و حداکثر {MAX_TOPIC_LEN} کاراکتر باشد. دوباره ارسال کنید:")
             return
         section = db.get_section_by_key(state["section_key"])
         db.add_topic(section["id"], text)
@@ -1141,8 +1374,8 @@ def _handle_fsm_message(chat_id: int, user_id: int, state: dict, text: str) -> N
         send_message(chat_id, f"✅ مبحث «{text}» اضافه شد.", topics_management_menu(topics, state["section_key"]))
 
     elif name == "rename_topic":
-        if not text:
-            send_message(chat_id, "❌ نام مبحث نمی‌تواند خالی باشد. دوباره ارسال کنید:")
+        if not text or len(text) > MAX_TOPIC_LEN:
+            send_message(chat_id, f"❌ نام مبحث باید غیرخالی و حداکثر {MAX_TOPIC_LEN} کاراکتر باشد. دوباره ارسال کنید:")
             return
         db.rename_topic(state["topic_id"], text)
         topic = db.get_topic(state["topic_id"])
@@ -1151,6 +1384,13 @@ def _handle_fsm_message(chat_id: int, user_id: int, state: dict, text: str) -> N
         send_message(chat_id, f"✅ نام مبحث به «{text}» تغییر یافت.", topic_detail_menu(topic, section["key"]))
 
     elif name == "edit_question_text":
+        if not text or len(text) > MAX_QUESTION_LEN:
+            send_message(chat_id, f"❌ متن سؤال باید غیرخالی و حداکثر {MAX_QUESTION_LEN} کاراکتر باشد (فقط متن بفرست). دوباره ارسال کنید:")
+            return
+        if db.get_question(state["question_id"]) is None:
+            clear_state(chat_id, user_id)
+            send_message(chat_id, "❌ این سؤال دیگر وجود ندارد.")
+            return
         db.update_question_text(state["question_id"], text)
         question = db.get_question(state["question_id"])
         clear_state(chat_id, user_id)
@@ -1161,25 +1401,37 @@ def _handle_fsm_message(chat_id: int, user_id: int, state: dict, text: str) -> N
         )
 
     elif name == "add_question_text":
-        if not text:
-            send_message(chat_id, "❌ متن سؤال نمی‌تواند خالی باشد. دوباره ارسال کنید:")
+        if not text or len(text) > MAX_QUESTION_LEN:
+            send_message(chat_id, f"❌ متن سؤال باید غیرخالی و حداکثر {MAX_QUESTION_LEN} کاراکتر باشد (فقط متن بفرست). دوباره ارسال کنید:")
             return
         set_state(chat_id, user_id, "add_question_opt_a", topic_id=state["topic_id"], question_text=text)
         send_message(chat_id, "گزینه A را ارسال کنید:")
 
     elif name == "add_question_opt_a":
+        if not text or len(text) > MAX_OPTION_LEN:
+            send_message(chat_id, f"❌ گزینه باید غیرخالی و حداکثر {MAX_OPTION_LEN} کاراکتر باشد (فقط متن بفرست). دوباره ارسال کنید:")
+            return
         set_state(chat_id, user_id, "add_question_opt_b", **{**state_data(state), "opt_a": text})
         send_message(chat_id, "گزینه B را ارسال کنید:")
 
     elif name == "add_question_opt_b":
+        if not text or len(text) > MAX_OPTION_LEN:
+            send_message(chat_id, f"❌ گزینه باید غیرخالی و حداکثر {MAX_OPTION_LEN} کاراکتر باشد (فقط متن بفرست). دوباره ارسال کنید:")
+            return
         set_state(chat_id, user_id, "add_question_opt_c", **{**state_data(state), "opt_b": text})
         send_message(chat_id, "گزینه C را ارسال کنید:")
 
     elif name == "add_question_opt_c":
+        if not text or len(text) > MAX_OPTION_LEN:
+            send_message(chat_id, f"❌ گزینه باید غیرخالی و حداکثر {MAX_OPTION_LEN} کاراکتر باشد (فقط متن بفرست). دوباره ارسال کنید:")
+            return
         set_state(chat_id, user_id, "add_question_opt_d", **{**state_data(state), "opt_c": text})
         send_message(chat_id, "گزینه D را ارسال کنید:")
 
     elif name == "add_question_opt_d":
+        if not text or len(text) > MAX_OPTION_LEN:
+            send_message(chat_id, f"❌ گزینه باید غیرخالی و حداکثر {MAX_OPTION_LEN} کاراکتر باشد (فقط متن بفرست). دوباره ارسال کنید:")
+            return
         set_state(chat_id, user_id, "add_question_correct", **{**state_data(state), "opt_d": text})
         send_message(chat_id, "✅ گزینه صحیح کدام است؟", correct_option_menu())
 
@@ -1510,6 +1762,9 @@ def _dispatch_callback(data, chat_id, user_id, message_id, cq_id, require_admin)
             return
         topic_id = int(data.split(":")[2])
         topic = db.get_topic(topic_id)
+        if topic is None:
+            answer_callback_query(cq_id, "❌ این مبحث دیگر وجود ندارد.", show_alert=True)
+            return
         section = db.get_section(topic["section_id"])
         note = "\n📦 این مبحث خودکار آرشیو می‌شود و قابل تغییر نام/حذف نیست." if topic["is_archive"] else ""
         edit_message_text(
@@ -1571,6 +1826,9 @@ def _dispatch_callback(data, chat_id, user_id, message_id, cq_id, require_admin)
             return
         topic_id = int(data.split(":")[2])
         topic = db.get_topic(topic_id)
+        if topic is None:
+            answer_callback_query(cq_id, "❌ این مبحث دیگر وجود ندارد.", show_alert=True)
+            return
         section = db.get_section(topic["section_id"])
         deleted = db.delete_topic(topic_id)
         if not deleted:
@@ -1614,6 +1872,9 @@ def _dispatch_callback(data, chat_id, user_id, message_id, cq_id, require_admin)
             return
         question_id = int(data.split(":")[2])
         question = db.get_question(question_id)
+        if question is None:
+            answer_callback_query(cq_id, "❌ این سؤال دیگر وجود ندارد.", show_alert=True)
+            return
         options_text = "\n".join(f"{o['label']}) {o['text']}{' ✅' if o['is_correct'] else ''}" for o in question["options"])
         edit_message_text(
             chat_id, message_id, f"❓ {question['text']}\n\n{options_text}",
@@ -1626,6 +1887,9 @@ def _dispatch_callback(data, chat_id, user_id, message_id, cq_id, require_admin)
             return
         question_id = int(data.split(":")[2])
         question = db.get_question(question_id)
+        if question is None:
+            answer_callback_query(cq_id, "❌ این سؤال دیگر وجود ندارد.", show_alert=True)
+            return
         topic_id = question["topic_id"]
         db.delete_question(question_id)
         topic = db.get_topic(topic_id)
@@ -1682,7 +1946,7 @@ def _dispatch_callback(data, chat_id, user_id, message_id, cq_id, require_admin)
     elif data == "menu:new_quiz":
         if not require_admin():
             return
-        if db.get_active_quiz_for_chat(chat_id):
+        if blocking_quiz_for_chat(chat_id):
             answer_callback_query(cq_id, "⚠️ یک کوییز فعال دیگر همین الان در این گروه در حال اجراست.", show_alert=True)
             return
         clear_state(chat_id, user_id)
@@ -1744,7 +2008,7 @@ def _dispatch_callback(data, chat_id, user_id, message_id, cq_id, require_admin)
         if seconds is None or count is None:
             answer_callback_query(cq_id, "⚠️ لطفاً هم زمان و هم تعداد سؤال را انتخاب کن.", show_alert=True)
             return
-        if db.get_active_quiz_for_chat(chat_id):
+        if blocking_quiz_for_chat(chat_id):
             answer_callback_query(cq_id, "⚠️ یک کوییز فعال دیگر همین الان در این گروه در حال اجراست.", show_alert=True)
             clear_state(chat_id, user_id)
             return
@@ -2083,6 +2347,18 @@ def _dispatch_callback(data, chat_id, user_id, message_id, cq_id, require_admin)
         answer_callback_query(cq_id)
 
 
+def _question_elapsed(quiz_id: int, qq: dict) -> float:
+    """مدت‌زمانی که از شروع «تایمر» همین سؤال گذشته، بدون احتساب زمان توقف موقت.
+    قبلاً از ساعت دیواری استفاده می‌شد؛ بعد از یک «توقف موقت» همه‌ی پاسخ‌ها
+    «زمان تمام شده» می‌خوردند و نمره‌ی جریمه هم اشتباه حساب می‌شد."""
+    with _active_lock:
+        control = _controls.get(quiz_id)
+    if control is not None:
+        return control.elapsed()
+    started_at = datetime.fromisoformat(qq["started_at"])
+    return (datetime.now(timezone.utc) - started_at).total_seconds()
+
+
 def _handle_answer(data: str, chat_id: int, user_id: int, cq_id: str) -> None:
     _, qq_id_str, option_id_str = data.split(":")
     quiz_question_id, option_id = int(qq_id_str), int(option_id_str)
@@ -2105,8 +2381,7 @@ def _handle_answer(data: str, chat_id: int, user_id: int, cq_id: str) -> None:
         answer_callback_query(cq_id, "❌ این سؤال هنوز شروع نشده است.", show_alert=True)
         return
 
-    started_at = datetime.fromisoformat(qq["started_at"])
-    response_time = (datetime.now(timezone.utc) - started_at).total_seconds()
+    response_time = _question_elapsed(quiz["id"], qq)
     if response_time > qq["duration_seconds"] + 1:
         answer_callback_query(cq_id, "❌ زمان پاسخ‌گویی به این سؤال تمام شده است.", show_alert=True)
         return
@@ -2117,10 +2392,14 @@ def _handle_answer(data: str, chat_id: int, user_id: int, cq_id: str) -> None:
         return
 
     score = compute_score(bool(selected["is_correct"]), response_time, qq["duration_seconds"], quiz["question_count"])
-    ok = db.record_answer(
-        quiz["id"], qq["id"], user_id, option_id, bool(selected["is_correct"]), response_time, score,
+    result = db.record_answer(
+        quiz["id"], qq["id"], user_id, option_id, bool(selected["is_correct"]),
+        min(response_time, float(qq["duration_seconds"])), score,
     )
-    if not ok:
+    if result == "closed":
+        answer_callback_query(cq_id, "❌ زمان پاسخ‌گویی به این سؤال تمام شده است.", show_alert=True)
+        return
+    if result != "ok":
         answer_callback_query(cq_id, "⚠️ شما قبلاً به این سؤال پاسخ داده‌اید.", show_alert=True)
         return
     answer_callback_query(cq_id, "✅ پاسخ ثبت شد!")
@@ -2168,20 +2447,31 @@ def main() -> None:
     log.info("Recovery pass complete. Starting polling...")
 
     offset = _read_offset()
+    failures = 0
     while True:
         try:
             updates = get_updates(offset, poll_timeout=30)
+            if updates is None:
+                # خطای شبکه/تلگرام: قبلاً بدون هیچ مکثی دوباره و دوباره تلاش می‌شد
+                # (حلقه‌ی داغ، CPU و باتری گوشی را می‌خورد و لاگ را پر می‌کرد).
+                failures += 1
+                time.sleep(min(30, 1 + failures * 2))
+                continue
+            failures = 0
+
+            for update in updates:
+                offset = update["update_id"] + 1
+                try:
+                    threading.Thread(target=handle_update, args=(update,), daemon=True).start()
+                except RuntimeError:
+                    log.exception("could not start handler thread; handling inline")
+                    handle_update(update)
+
+            if updates:
+                _write_offset(offset)
         except Exception:
-            log.exception("Polling error, retrying in 3s")
+            log.exception("Polling loop error, retrying in 3s")
             time.sleep(3)
-            continue
-
-        for update in updates:
-            offset = update["update_id"] + 1
-            threading.Thread(target=handle_update, args=(update,), daemon=True).start()
-
-        if updates:
-            _write_offset(offset)
 
 
 if __name__ == "__main__":

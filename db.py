@@ -26,14 +26,81 @@ ARCHIVE_TOPIC_TITLES = {
 }
 
 _lock = threading.RLock()
-_conn: sqlite3.Connection | None = None
+_conn: "_LockedConn | None" = None
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def get_conn() -> sqlite3.Connection:
+class _Result:
+    """نتیجه‌ی کاملاً خوانده‌شده‌ی یک کوئری - بعد از آزاد شدن قفل هم امن است."""
+    __slots__ = ("_rows", "_pos", "lastrowid", "rowcount")
+
+    def __init__(self, rows, lastrowid=None, rowcount=-1):
+        self._rows = rows
+        self._pos = 0
+        self.lastrowid = lastrowid
+        self.rowcount = rowcount
+
+    def fetchone(self):
+        if self._pos < len(self._rows):
+            row = self._rows[self._pos]
+            self._pos += 1
+            return row
+        return None
+
+    def fetchall(self):
+        rows = self._rows[self._pos:]
+        self._pos = len(self._rows)
+        return rows
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class _LockedConn:
+    """پوشش دور اتصال sqlite: «هر» عملیات (خواندن هم) زیر همان قفل سراسری اجرا
+    می‌شود و نتیجه کامل خوانده می‌شود. قبلاً خواندن‌ها بدون قفل و هم‌زمان با
+    نوشتن/rollback ترد دیگر روی یک اتصال مشترک انجام می‌شد و می‌توانست باعث
+    خطاهای تصادفی و گیر کردن کوییز شود."""
+
+    def __init__(self, raw: sqlite3.Connection):
+        self._raw = raw
+
+    def execute(self, sql, params=()):
+        with _lock:
+            cur = self._raw.execute(sql, params)
+            rows = cur.fetchall() if cur.description is not None else []
+            return _Result(rows, cur.lastrowid, cur.rowcount)
+
+    def executemany(self, sql, seq):
+        with _lock:
+            cur = self._raw.executemany(sql, seq)
+            return _Result([], cur.lastrowid, cur.rowcount)
+
+    def executescript(self, script):
+        with _lock:
+            return self._raw.executescript(script)
+
+    def commit(self):
+        with _lock:
+            self._raw.commit()
+
+    def rollback(self):
+        with _lock:
+            self._raw.rollback()
+
+    def backup(self, target):
+        with _lock:
+            self._raw.backup(target)
+
+    def close(self):
+        with _lock:
+            self._raw.close()
+
+
+def get_conn() -> "_LockedConn":
     global _conn
     conn = _conn
     if conn is None:
@@ -42,9 +109,17 @@ def get_conn() -> sqlite3.Connection:
         with _lock:
             conn = _conn
             if conn is None:
-                conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA foreign_keys = ON")
+                raw = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+                raw.row_factory = sqlite3.Row
+                raw.execute("PRAGMA foreign_keys = ON")
+                try:
+                    # WAL + NORMAL: ثبت پاسخ‌ها خیلی سریع‌تر می‌شود (مهم روی گوشی/Termux
+                    # وقتی ده‌ها نفر هم‌زمان جواب می‌دهند).
+                    raw.execute("PRAGMA journal_mode = WAL")
+                    raw.execute("PRAGMA synchronous = NORMAL")
+                except sqlite3.DatabaseError:
+                    pass
+                conn = _LockedConn(raw)
                 _conn = conn
     return conn
 
@@ -167,7 +242,7 @@ def init_db() -> None:
         _seed_archive_topics(conn)
 
 
-def _migrate_schema(conn: sqlite3.Connection) -> None:
+def _migrate_schema(conn) -> None:
     """برای دیتابیس‌هایی که با نسخه‌ی قدیمی‌تر ساخته شده‌اند - چون
     CREATE TABLE IF NOT EXISTS ستون تازه را به جدول از قبل موجود اضافه
     نمی‌کند، اینجا دستی چک و اضافه می‌شود."""
@@ -177,7 +252,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
-def _seed_sections(conn: sqlite3.Connection) -> None:
+def _seed_sections(conn) -> None:
     existing = {r["key"] for r in conn.execute("SELECT key FROM sections")}
     to_add = []
     if "previous_terms" not in existing:
@@ -189,7 +264,7 @@ def _seed_sections(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
-def _seed_archive_topics(conn: sqlite3.Connection) -> None:
+def _seed_archive_topics(conn) -> None:
     for key, title in ARCHIVE_TOPIC_TITLES.items():
         section = conn.execute("SELECT id FROM sections WHERE key=?", (key,)).fetchone()
         if not section:
@@ -423,6 +498,21 @@ def rename_topic(topic_id: int, new_name: str) -> bool:
         return True
 
 
+
+def _remove_question_rows(conn, qid: int) -> None:
+    """اگر سؤال در کوییزی استفاده شده باشد (کلید خارجی quiz_questions/answers)،
+    حذف فیزیکی خطای IntegrityError می‌دهد؛ در این حالت فقط غیرفعال می‌شود
+    (از بانک سؤال‌ها و کوییزهای بعدی حذف می‌شود ولی سابقه‌ی کوییز خراب نمی‌شود)."""
+    in_use = conn.execute(
+        "SELECT 1 FROM quiz_questions WHERE question_id=? LIMIT 1", (qid,)
+    ).fetchone()
+    if in_use:
+        conn.execute("UPDATE questions SET is_active=0, source_question_id=NULL WHERE id=?", (qid,))
+    else:
+        conn.execute("DELETE FROM options WHERE question_id=?", (qid,))
+        conn.execute("DELETE FROM questions WHERE id=?", (qid,))
+
+
 def delete_topic(topic_id: int) -> bool:
     with _lock:
         topic = get_topic(topic_id)
@@ -440,12 +530,18 @@ def delete_topic(topic_id: int) -> bool:
         # ترتیب مهم است: فرزندها (کپی‌های آرشیوی) باید قبل از پدرها (سؤالات
         # اصلی همین مبحث) حذف شوند، وگرنه کلید خارجی source_question_id خطا می‌دهد.
         for qid in copy_ids:
-            conn.execute("DELETE FROM options WHERE question_id=?", (qid,))
-            conn.execute("DELETE FROM questions WHERE id=?", (qid,))
+            _remove_question_rows(conn, qid)
         for qid in q_ids:
-            conn.execute("DELETE FROM options WHERE question_id=?", (qid,))
-            conn.execute("DELETE FROM questions WHERE id=?", (qid,))
+            _remove_question_rows(conn, qid)
 
+        # سؤال‌هایی که در کوییز قدیمی استفاده شده‌اند فقط غیرفعال شده‌اند و هنوز به
+        # این مبحث اشاره می‌کنند؛ آن‌ها را (غیرفعال) به مبحث آرشیوی همان بخش
+        # منتقل می‌کنیم تا حذف مبحث با خطای کلید خارجی مواجه نشود.
+        archive = get_archive_topic(topic["section_id"])
+        if archive:
+            conn.execute("UPDATE questions SET topic_id=? WHERE topic_id=?", (archive["id"], topic_id))
+        # کوییزهای قدیمی هم به این مبحث اشاره می‌کنند (کلید خارجی).
+        conn.execute("UPDATE quizzes SET topic_id=NULL WHERE topic_id=?", (topic_id,))
         conn.execute("DELETE FROM topics WHERE id=?", (topic_id,))
         conn.commit()
         return True
@@ -504,7 +600,7 @@ def get_question(question_id: int) -> dict | None:
     return _attach_options(row) if row else None
 
 
-def _insert_question(conn: sqlite3.Connection, topic_id: int, text: str,
+def _insert_question(conn, topic_id: int, text: str,
                       options: list[tuple[str, str]], correct_label: str,
                       source_question_id: int | None = None) -> int:
     cur = conn.execute(
@@ -537,7 +633,7 @@ def add_question(topic_id: int, text: str, options: list[tuple[str, str]], corre
         return question_id
 
 
-def _linked_question_ids(conn: sqlite3.Connection, question_id: int) -> list[int]:
+def _linked_question_ids(conn, question_id: int) -> list[int]:
     """آیدیِ نسخه‌ی «جفتِ» این سؤال را برمی‌گرداند: اگر خودش یک کپی آرشیوی
     است، آیدی نسخه‌ی اصلی؛ اگر خودش نسخه‌ی اصلی است، آیدی همه‌ی کپی‌های
     آرشیوی‌اش."""
@@ -580,8 +676,7 @@ def delete_question(question_id: int) -> None:
             # خارجیِ source_question_id خطا می‌دهد.
             ordered_ids = linked + [question_id]
         for qid in ordered_ids:
-            conn.execute("DELETE FROM options WHERE question_id=?", (qid,))
-            conn.execute("DELETE FROM questions WHERE id=?", (qid,))
+            _remove_question_rows(conn, qid)
         conn.commit()
 
 
@@ -646,6 +741,13 @@ def list_recoverable_quizzes() -> list[int]:
 def set_status(quiz_id: int, status: str) -> None:
     with _lock:
         conn = get_conn()
+        cur_row = conn.execute("SELECT status FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
+        if cur_row is None:
+            return
+        if cur_row["status"] in ("cancelled", "finished") and status not in ("cancelled", "finished"):
+            # مثلاً ادمین «لغو» را زده و هم‌زمان ترد کوییز می‌خواسته وضعیت را
+            # question_active کند - لغو نباید گم شود.
+            return
         conn.execute("UPDATE quizzes SET status=? WHERE id=?", (status, quiz_id))
         if status == "running":
             row = conn.execute("SELECT started_at FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
@@ -654,6 +756,11 @@ def set_status(quiz_id: int, status: str) -> None:
         if status in ("finished", "cancelled"):
             conn.execute("UPDATE quizzes SET finished_at=? WHERE id=?", (_now(), quiz_id))
         conn.commit()
+
+
+def get_quiz_status(quiz_id: int) -> str | None:
+    row = get_conn().execute("SELECT status FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
+    return row["status"] if row else None
 
 
 def set_announce_message(quiz_id: int, message_id: int) -> None:
@@ -755,12 +862,16 @@ def record_answer(
     is_correct: bool,
     response_time: float,
     score: float,
-) -> bool:
-    """False اگر قبلاً پاسخ داده بود (یا هم‌زمان یک پاسخ دیگر برنده شد) - Race-safe
-    به لطف UNIQUE(quiz_question_id, user_id) واقعی در سطح دیتابیس.
-    """
+) -> str:
+    """'ok' اگر ثبت شد، 'duplicate' اگر قبلاً پاسخ داده بود، 'closed' اگر سؤال
+    همین الان بسته شده - Race-safe (همه چیز زیر یک قفل و UNIQUE دیتابیس)."""
     with _lock:
         conn = get_conn()
+        qq = conn.execute(
+            "SELECT is_finished FROM quiz_questions WHERE id=?", (quiz_question_id,)
+        ).fetchone()
+        if qq is None or qq["is_finished"]:
+            return "closed"
         try:
             conn.execute(
                 "INSERT INTO answers (quiz_id, quiz_question_id, user_id, selected_option_id, "
@@ -770,14 +881,14 @@ def record_answer(
             )
         except sqlite3.IntegrityError:
             conn.rollback()
-            return False
+            return "duplicate"
         if score:
             conn.execute(
                 "UPDATE quiz_participants SET total_score = total_score + ? WHERE quiz_id=? AND user_id=?",
                 (score, quiz_id, user_id),
             )
         conn.commit()
-        return True
+        return "ok"
 
 
 def answers_for_question(quiz_question_id: int) -> list[dict]:
